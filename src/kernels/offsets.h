@@ -68,17 +68,23 @@ struct kernel_offsets {
  * 0xffffffc008000000, so every entry using this profile must also set
  * .image_text_base.  Values measured on the device (see
  * work/EQS_HARDENING_DESIGN.md); real_cred/cred/prio/... match the other
- * android12-5.10 target (aristotle 5.10.136) exactly.
- * NOTE: pid/tgid/tasks/atomic_flags/seccomp are still unverified for 5.10 and
- * are deliberately left 0 -- the core must not silently use its 6.x defaults
- * for them on a 5.10 target. */
+ * android12-5.10 target (aristotle 5.10.136) exactly. comm and seccomp come
+ * from disassembling the device's own vmlinux (work/kernel_elf):
+ *   __set_task_comm       -> memcpy to task+0x790
+ *   __secure_computing    -> ldr  w9,[current,#0x848]   (seccomp.mode)
+ *   seccomp_run_filters   -> ldar x23,[current,#0x850]  (seccomp.filter)
+ * They live here, not in the per-kernel entry, so a target can inherit them
+ * without triggering a -Winitializer-overrides warning.
+ * task_pid/task_tgid/task_tasks/task_atomic_flags are deliberately left 0: they
+ * are not referenced anywhere in src/core today, and 0 keeps them on the
+ * documented "unverified" list instead of silently pretending to be 6.x values. */
 #define STRUCT_OFFSETS_5_10                                                    \
   .task_prio = 0x84, .task_normal_prio = 0x8C, .task_sched_task_group = 0x310, \
   .task_pi_lock = 0x86C, .task_pi_waiters = 0x880,                             \
   .task_pi_top_task = 0x890, .task_pi_blocked_on = 0x898,                      \
   .task_pid = 0, .task_tgid = 0,                                               \
   .task_atomic_flags = 0, .task_real_cred = 0x778, .task_cred = 0x780,         \
-  .task_comm = 0x790, .task_tasks = 0, .task_seccomp = 0,                      \
+  .task_comm = 0x790, .task_tasks = 0, .task_seccomp = 0x848,                  \
   .compact_waiter = 2, .mm_struct_sz = 0x3C0
 
 static const struct kernel_offsets known_offsets[] = {
