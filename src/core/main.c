@@ -1239,6 +1239,13 @@ static int run_eqs_exploit(void) {
     TIMER("eqs zero selftest done");
     return ok ? 0 : 2;
   }
+  /* End-to-end seccomp-clear proof: STRICT on this task, cleared by a
+   * filter-free child through shape-2 zero writes. */
+  if (getenv("GHOSTLOCK_SECCOMP_TEST")) {
+    int ok = slide_eqs_seccomp_selftest();
+    TIMER("eqs seccomp selftest done");
+    return ok ? 0 : 2;
+  }
 
   TIMER("eqs leak start");
   if (!slide_leak_kernel_base()) {

@@ -248,6 +248,7 @@ int slide_eqs_root_stage(void);
  * self-contained non-vacuous proof of the primitive. */
 int slide_eqs_zero_write(uintptr_t target, const char *name, int *idx);
 int slide_eqs_zero_selftest(void);
+int slide_eqs_seccomp_selftest(void);
 
 #include "runtime_struct_offsets.h"
 
