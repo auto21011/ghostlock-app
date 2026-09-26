@@ -40,7 +40,6 @@ OFFSETS_ENTRY(
     STRUCT_OFFSETS_5_10,
     .kernel_phys_load = 0xA8000000,
     .pselect_waiter_shift = 0,
-    .image_text_base = 0xffffffc008000000,
     .off_init_task = 0x0279be80,
     .off_init_cred = 0x027b0a60,
     .off_root_task_group = 0x02993040,

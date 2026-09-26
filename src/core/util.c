@@ -207,10 +207,18 @@ uintptr_t p0_data_alias(uintptr_t image_addr) {
 }
 
 /* Per-target kernel image virtual base: android12-5.10 keeps the image at
- * 0xffffffc008000000, the GKI 6.1+/6.6/6.12 targets at 0xffffffc080000000. */
+ * 0xffffffc008000000, the GKI 6.1+/6.6/6.12 targets at 0xffffffc080000000.
+ * Keyed off the waiter variant (compact_waiter == 2, the 5.10 flat waiter)
+ * rather than a per-entry field on purpose: the app's
+ * GenerateSupportedKernelsTask parses every literal under src/kernels with
+ * kotlin.text.toLong(16) at Gradle configuration time, and a full-width address
+ * like 0xffffffc008000000 overflows Long and breaks the APK build. See the
+ * header comment in src/kernels/offsets.h. */
+#define KIMAGE_TEXT_BASE_5_10 0xffffffc008000000ULL
+
 uintptr_t active_image_text_base(void) {
-  if (active_offsets && active_offsets->image_text_base) {
-    return (uintptr_t)active_offsets->image_text_base;
+  if (active_offsets && active_offsets->compact_waiter == 2) {
+    return (uintptr_t)KIMAGE_TEXT_BASE_5_10;
   }
   return (uintptr_t)KIMAGE_TEXT_BASE;
 }

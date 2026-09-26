@@ -23,10 +23,19 @@ val supportedKernelsSrc = layout.buildDirectory.dir("generated/source/supportedK
 val sharedOffsetsHeader = rootProject.file("src/kernels/offsets.h")
 val offsetFieldRe = Regex("\\.([A-Za-z0-9_]+)\\s*=\\s*(0[xX][0-9A-Fa-f]+|-?\\d+)")
 
-fun parseOffsetValue(text: String): Long = if (text.length > 2 && text.startsWith("0x", ignoreCase = true)) {
-    text.substring(2).toLong(16)
-} else {
-    text.toLong()
+fun parseOffsetValue(text: String): Long = try {
+    if (text.length > 2 && text.startsWith("0x", ignoreCase = true)) {
+        text.substring(2).toLong(16)
+    } else {
+        text.toLong()
+    }
+} catch (e: NumberFormatException) {
+    throw GradleException(
+        "offsets literal '$text' does not fit in a signed 64-bit Long. Every numeric literal in " +
+            "src/kernels/**/offsets.h and in the STRUCT_OFFSETS_* macros is parsed here (and by the C " +
+            "side), so full-width kernel addresses such as 0xffffffc008000000 are not allowed -- derive " +
+            "them in C instead (see the header comment in src/kernels/offsets.h).",
+    )
 }
 
 fun formatOffsetValue(value: Long): String = if (value < 0) "${value}L" else "0x${value.toString(16)}L"

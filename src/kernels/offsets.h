@@ -4,17 +4,26 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* IMPORTANT -- every numeric literal in a per-kernel entry (and in the
+ * STRUCT_OFFSETS_* macros below) must fit in a signed 64-bit Kotlin Long, i.e.
+ * be <= 0x7fffffffffffffff. The app's GenerateSupportedKernelsTask parses these
+ * same headers with kotlin.text.toLong(16) at Gradle configuration time, and a
+ * full-width kernel address such as 0xffffffc008000000 overflows Long and fails
+ * the APK build (HTTP 500 at :app:assembleRelease, "Build Release APK" step).
+ * That is also why the kernel image base is not a per-entry field: android12-5.10
+ * maps the image at 0xffffffc008000000 while the GKI 6.1+/6.6/6.12 targets use
+ * 0xffffffc080000000, and active_image_text_base() (src/core/util.c) derives the
+ * 5.10 base from .compact_waiter == 2 instead of storing it here. All off_*
+ * values below are relative to that base. Note the C JSON reader
+ * (src/core/offsets_json.c) accumulates digits into a uint64_t, so hex is safe
+ * there but a negative decimal would not be. */
+
 struct kernel_offsets {
   const char *uname_r;
   /* Bootloader-selected physical load address; 0 uses target.h. */
   uint64_t kernel_phys_load;
   /* pselect fd_set waiter word shift; 0 uses target.h default. */
   int pselect_waiter_shift;
-  /* Kernel image virtual base; 0 uses target.h KIMAGE_TEXT_BASE.
-   * android12-5.10 maps the image at 0xffffffc008000000 while the 6.1+/6.6/6.12
-   * GKI targets use 0xffffffc080000000, so this has to be per-target; every
-   * off_* symbol value below is relative to it. */
-  uint64_t image_text_base;
   uint64_t off_init_task, off_init_cred;
   uint64_t off_root_task_group, off_selinux_enforcing;
   uint64_t off_selinux_blob_sizes, off_security_hook_heads;
@@ -64,9 +73,9 @@ struct kernel_offsets {
   .task_comm = 0x830, .task_tasks = 0x550, .task_seccomp = 0x8E8
 
 /* android12-5.10 (eqs / Motorola X30 Pro, 5.10.233). 5.10 has the FLAT
- * rt_mutex_waiter (compact_waiter = 2) and keeps the kernel image at
- * 0xffffffc008000000, so every entry using this profile must also set
- * .image_text_base.  Values measured on the device (see
+ * rt_mutex_waiter (compact_waiter = 2); the kernel image base for that variant
+ * (0xffffffc008000000) is derived in active_image_text_base(), not stored here.
+ *  Values measured on the device (see
  * work/EQS_HARDENING_DESIGN.md); real_cred/cred/prio/... match the other
  * android12-5.10 target (aristotle 5.10.136) exactly. comm and seccomp come
  * from disassembling the device's own vmlinux (work/kernel_elf):
