@@ -243,6 +243,11 @@ int slide_child_arm_and_run(void);
 uint64_t slide_read_stext(void);
 int slide_leak_kernel_base(void);
 int slide_eqs_root_stage(void);
+/* shape-2 zero write: *(target) = 0 via the no-child rb_erase path (used to
+ * clear TIF_SECCOMP / seccomp.mode). GHOSTLOCK_ZERO_TEST=1 runs only the
+ * self-contained non-vacuous proof of the primitive. */
+int slide_eqs_zero_write(uintptr_t target, const char *name, int *idx);
+int slide_eqs_zero_selftest(void);
 
 #include "runtime_struct_offsets.h"
 

