@@ -50,12 +50,9 @@ OFFSETS_ENTRY(
     .off_slide_nfulnl_logger = 0x02791338,
     .off_slide_boot_id = 0x028a7d28,
     .off_slide_loggers_0_1 = 0x02791318,
-    /* NOTE for STRUCT_OFFSETS_5_10 (src/kernels/offsets.h): measure
-     * task_seccomp = 0x848 from work/kernel_elf --
-     *   __secure_computing : `ldr w9,[current,#0x848]` = current->seccomp.mode
-     *   seccomp_run_filters: `ldar x23,[current,#0x850]` = ->seccomp.filter
-     * (0x84c is filter_count). It is left 0 in the macro for now: the eqs/5.10
-     * path never reaches the generic W3 seccomp write (run_exploit branches to
-     * slide_eqs.c before W1/W2/W3), and setting it here as well would trip
-     * -Winitializer-overrides. */
+    /* task_comm = 0x790 (__set_task_comm memcpy) and task_seccomp = 0x848
+     * (__secure_computing `ldr w9,[current,#0x848]`; seccomp_run_filters reads
+     * ->seccomp.filter at 0x850, so 0x84c is filter_count) are carried by
+     * STRUCT_OFFSETS_5_10 in src/kernels/offsets.h. They are not repeated here
+     * (that would trip -Winitializer-overrides). */
 ),
