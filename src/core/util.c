@@ -201,9 +201,18 @@ void init_p0_profile(void) {
 }
 
 uintptr_t p0_data_alias(uintptr_t image_addr) {
-  uintptr_t off = image_addr - KIMAGE_TEXT_BASE;
+  uintptr_t off = image_addr - active_image_text_base();
   uintptr_t phys = p0_kernel_phys_load + off;
   return ((phys - P0_PHYS_OFFSET) | P0_PAGE_OFFSET);
+}
+
+/* Per-target kernel image virtual base: android12-5.10 keeps the image at
+ * 0xffffffc008000000, the GKI 6.1+/6.6/6.12 targets at 0xffffffc080000000. */
+uintptr_t active_image_text_base(void) {
+  if (active_offsets && active_offsets->image_text_base) {
+    return (uintptr_t)active_offsets->image_text_base;
+  }
+  return (uintptr_t)KIMAGE_TEXT_BASE;
 }
 
 uintptr_t data_addr(uintptr_t image_addr) {

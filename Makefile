@@ -17,7 +17,8 @@ SRCS := \
   src/core/main.c \
   src/core/offsets_json.c \
   src/core/util.c \
-  src/core/fops.c
+  src/core/fops.c \
+  src/core/slide_eqs.c
 
 # Headers also trigger a rebuild (e.g. a freshly --register-ed src/kernels/<release>/offsets.h).
 HDRS := $(wildcard src/core/*.h src/core/*/*.h src/kernels/*.h src/kernels/*/*.h)

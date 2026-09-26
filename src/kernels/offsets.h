@@ -1,6 +1,7 @@
 #ifndef OFFSETS_H
 #define OFFSETS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 struct kernel_offsets {
@@ -9,6 +10,11 @@ struct kernel_offsets {
   uint64_t kernel_phys_load;
   /* pselect fd_set waiter word shift; 0 uses target.h default. */
   int pselect_waiter_shift;
+  /* Kernel image virtual base; 0 uses target.h KIMAGE_TEXT_BASE.
+   * android12-5.10 maps the image at 0xffffffc008000000 while the 6.1+/6.6/6.12
+   * GKI targets use 0xffffffc080000000, so this has to be per-target; every
+   * off_* symbol value below is relative to it. */
+  uint64_t image_text_base;
   uint64_t off_init_task, off_init_cred;
   uint64_t off_root_task_group, off_selinux_enforcing;
   uint64_t off_selinux_blob_sizes, off_security_hook_heads;
@@ -20,7 +26,9 @@ struct kernel_offsets {
   uint32_t task_pid, task_tgid, task_atomic_flags;
   uint32_t task_real_cred, task_cred, task_comm, task_tasks, task_seccomp;
 
-  /* rt_mutex_waiter layout: 0 = 6.6 rb_node, 1 = 6.1 compact tree_entry */
+  /* rt_mutex_waiter layout: 0 = 6.6 rb_node, 1 = 6.1 compact tree_entry,
+   * 2 = 5.10 flat (tree_entry@0, pi_tree_entry@0x18, task@0x30, lock@0x38,
+   *     prio@0x40, deadline@0x48; no wake_state/ww_ctx) */
   uint8_t compact_waiter;
   /* mm_struct SLUB stride; 0 uses target.h default (6.6 GKI 0x500).
    * android14-6.1 uses 0x400 (BTF reports 0x3c0). */
@@ -55,8 +63,27 @@ struct kernel_offsets {
   .task_atomic_flags = 0x5D8, .task_real_cred = 0x818, .task_cred = 0x820,     \
   .task_comm = 0x830, .task_tasks = 0x550, .task_seccomp = 0x8E8
 
+/* android12-5.10 (eqs / Motorola X30 Pro, 5.10.233). 5.10 has the FLAT
+ * rt_mutex_waiter (compact_waiter = 2) and keeps the kernel image at
+ * 0xffffffc008000000, so every entry using this profile must also set
+ * .image_text_base.  Values measured on the device (see
+ * work/EQS_HARDENING_DESIGN.md); real_cred/cred/prio/... match the other
+ * android12-5.10 target (aristotle 5.10.136) exactly.
+ * NOTE: pid/tgid/tasks/atomic_flags/seccomp are still unverified for 5.10 and
+ * are deliberately left 0 -- the core must not silently use its 6.x defaults
+ * for them on a 5.10 target. */
+#define STRUCT_OFFSETS_5_10                                                    \
+  .task_prio = 0x84, .task_normal_prio = 0x8C, .task_sched_task_group = 0x310, \
+  .task_pi_lock = 0x86C, .task_pi_waiters = 0x880,                             \
+  .task_pi_top_task = 0x890, .task_pi_blocked_on = 0x898,                      \
+  .task_pid = 0, .task_tgid = 0,                                               \
+  .task_atomic_flags = 0, .task_real_cred = 0x778, .task_cred = 0x780,         \
+  .task_comm = 0x790, .task_tasks = 0, .task_seccomp = 0,                      \
+  .compact_waiter = 2, .mm_struct_sz = 0x3C0
+
 static const struct kernel_offsets known_offsets[] = {
 /* Add new kernels by creating src/kernels/<uname-release>/offsets.h */
+#include "5.10.233-android12-9-00062-g49c66df526b8-ab13101360/offsets.h"
 #include "6.1.115-android14-11-ga2521ca27699-ab13294383/offsets.h"
 #include "6.1.118-android14-11-ga3b9c44908dd-ab13320413/offsets.h"
 #include "6.1.118-android14-11-gca0ef6d17716-ab13624819/offsets.h"

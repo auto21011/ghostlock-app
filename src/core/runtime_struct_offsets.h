@@ -7,8 +7,11 @@ extern const struct kernel_offsets *active_offsets;
 
 #define _RSO(field, fallback) (active_offsets && active_offsets->field ? active_offsets->field : (fallback))
 #define _RSO_64(field, fallback) ((uint64_t)_RSO(field, fallback))
+/* Every off_* symbol value is relative to the target's own image base, which is
+ * 0xffffffc080000000 on the 6.1+/6.6/6.12 GKI targets but 0xffffffc008000000
+ * on android12-5.10; active_image_text_base() resolves the per-target base. */
 #define _RSO_IMAGE(field, fallback) \
-  (KIMAGE_TEXT_BASE + _RSO_64(field, fallback))
+  (active_image_text_base() + _RSO_64(field, fallback))
 
 /* Override symbol macros with the selected device entry. */
 #undef INIT_TASK
